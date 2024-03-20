@@ -85,6 +85,7 @@ export const Registration: FC = ({ children }) => {
         <button id="btnBegin">Start Registration</button>
         <p id="success"></p>
         <p id="error"></p>
+        <a href="/">Go to home</a>
       </main>
       {registrationScript}
     </Layout>

@@ -1,18 +1,25 @@
 /** @jsx jsx */
 import { Hono } from "https://deno.land/x/hono@v4.1.2/mod.ts";
 import { jsx } from "https://deno.land/x/hono@v4.1.2/middleware.ts";
-import { sessionMiddleware } from "https://deno.land/x/hono_sessions@v0.3.4/mod.ts";
+import {
+  type Session,
+  sessionMiddleware,
+} from "https://deno.land/x/hono_sessions@v0.3.4/mod.ts";
 import { DenoKvStore } from "https://deno.land/x/hono_sessions@v0.3.4/src/store/deno/DenoKvStore.ts";
 import {
+  generateAuthenticationOptions,
   generateRegistrationOptions,
+  verifyAuthenticationResponse,
   verifyRegistrationResponse,
 } from "https://deno.land/x/simplewebauthn@v9.0.3/deno/server.ts";
 import type {
   AuthenticatorTransportFuture,
   CredentialDeviceType,
 } from "https://deno.land/x/simplewebauthn@v9.0.3/deno/types.ts";
-import { Registration } from "./registration.tsx";
+import * as base64url from "https://deno.land/std@0.220.1/encoding/base64url.ts";
 import { Layout } from "./layout.tsx";
+import { Registration } from "./registration.tsx";
+import { Login } from "./login.tsx";
 
 /**
  * It is strongly advised that authenticators get their own DB
@@ -47,11 +54,21 @@ type User = {
   authenticators: Authenticator[];
 };
 
+type PublicKeyItem = {
+  userId: User["id"],
+  authenticator: Authenticator;
+};
+
 const kv = await Deno.openKv("deno-kv/tmp.db");
 
 const sessionStore = new DenoKvStore(kv);
 
-const app = new Hono();
+const app = new Hono<{
+  Variables: {
+    session: Session;
+    session_key_rotation: boolean;
+  };
+}>();
 
 app.use("*", sessionMiddleware({ store: sessionStore }));
 
@@ -61,6 +78,8 @@ app.get("/", (c) => {
       <main>
         <h1>Passkey demo app</h1>
         <a href="/registration">Click here to registration!</a>
+        <br />
+        <a href="/login">Click here to login!</a>
       </main>
     </Layout>,
   );
@@ -68,6 +87,10 @@ app.get("/", (c) => {
 
 app.get("/registration", (c) => {
   return c.html(<Registration />);
+});
+
+app.get("/login", (c) => {
+  return c.html(<Login />);
 });
 
 // Human-readable title for your website
@@ -83,7 +106,7 @@ app.post("/generate-registration-options", async (c) => {
   console.log(data);
 
   const user: User =
-    (await kv.get<User>(["users_by_email", data.email])).value ?? {
+    (await kv.get<User>(["users_by_email", data.email])).pubkeyItem ?? {
       id: crypto.randomUUID().toString(),
       email: data.email,
       name: data.name,
@@ -185,6 +208,8 @@ app.post("/verify-registration", async (c) => {
     credentialBackedUp,
   } = registrationInfo!;
 
+  console.log("registration info", registrationInfo);
+
   const newAuthenticator: Authenticator = {
     credentialID,
     credentialPublicKey,
@@ -210,7 +235,65 @@ app.post("/verify-registration", async (c) => {
     userWithAuthenticator,
   );
 
+  await kv.set(["public_keys", base64url.encodeBase64Url(newAuthenticator.credentialID)], {
+    userId: user.id,
+    authenticator: newAuthenticator,
+  });
+
   return c.json(verification);
+});
+
+app.get("/generate-authentication-options", async (c) => {
+  const options = await generateAuthenticationOptions({
+    rpID,
+    userVerification: "preferred",
+  });
+
+  const session = c.get("session");
+
+  session.set("loginChallenge", options.challenge);
+
+  return c.json(options);
+});
+
+app.post("/verify-authentication", async (c) => {
+  const session = c.get("session");
+
+  const expectedChallenge = session.get("loginChallenge") as string;
+
+  const data = await c.req.json();
+
+  const { value: pubkeyItem } = await kv.get<PublicKeyItem>(["public_keys", data.id]);
+
+  if (!pubkeyItem) {
+    c.status(400);
+    return c.text("no credentials found.");
+  }
+
+  const { userId, authenticator } = pubkeyItem;
+
+  let verification;
+  try {
+    verification = await verifyAuthenticationResponse({
+      response: data,
+      expectedChallenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      authenticator,
+    });
+  } catch (e) {
+    c.status(400);
+    return c.text("unexpectedly verification failed.");
+  }
+
+  if (!verification.verified) {
+    c.status(400);
+    return c.text("verification failed.");
+  }
+
+  const { value: user } = await kv.get(["users", userId]);
+
+  return c.json({ verification, user });
 });
 
 Deno.serve(app.fetch);
